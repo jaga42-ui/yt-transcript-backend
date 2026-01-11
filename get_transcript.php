@@ -1,40 +1,39 @@
 <?php
-// ===============================
-// FORCE CORS (MUST BE FIRST)
-// ===============================
+/* ===============================
+   CORS HEADERS (MUST BE FIRST)
+================================ */
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization");
+header("Access-Control-Allow-Headers: Content-Type");
 header("Content-Type: application/json");
 
-// Handle preflight request
+// Handle preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit;
 }
 
-// ===============================
-// INPUT VALIDATION
-// ===============================
+/* ===============================
+   INPUT VALIDATION
+================================ */
 if (!isset($_GET['video_id']) || empty($_GET['video_id'])) {
     echo json_encode([
         "success" => false,
-        "error" => "No Video ID provided"
+        "error" => "No video ID provided"
     ]);
     exit;
 }
 
 $videoId = preg_replace('/[^a-zA-Z0-9_-]/', '', $_GET['video_id']);
 
-// ===============================
-// TRANSCRIPT FUNCTION
-// ===============================
-function get_youtube_transcript($vId) {
-
+/* ===============================
+   FETCH PLAYER DATA (WITH RETRY)
+================================ */
+function fetch_player_data($videoId) {
     $url = "https://www.youtube.com/youtubei/v1/player";
 
-    $data = [
-        "videoId" => $vId,
+    $payload = [
+        "videoId" => $videoId,
         "context" => [
             "client" => [
                 "hl" => "en",
@@ -50,34 +49,62 @@ function get_youtube_transcript($vId) {
                 "Content-Type: application/json\r\n" .
                 "User-Agent: Mozilla/5.0\r\n",
             "method" => "POST",
-            "content" => json_encode($data),
+            "content" => json_encode($payload),
             "timeout" => 10
         ]
     ];
 
     $context = stream_context_create($options);
-    $response = @file_get_contents($url, false, $context);
-    if ($response === false) return false;
 
-    $resData = json_decode($response, true);
-    if (!$resData) return false;
+    // First attempt
+    $response = @file_get_contents($url, false, $context);
+
+    // Retry once if failed (YouTube instability)
+    if ($response === false) {
+        sleep(1);
+        $response = @file_get_contents($url, false, $context);
+    }
+
+    return $response ? json_decode($response, true) : null;
+}
+
+/* ===============================
+   EXTRACT TRANSCRIPT
+================================ */
+function get_youtube_transcript($videoId) {
+
+    $data = fetch_player_data($videoId);
+    if (!$data) return false;
 
     $tracks =
-        $resData["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
+        $data["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
         ?? null;
 
-    if (!$tracks) return false;
+    if (!$tracks || empty($tracks)) return false;
 
-    $track = $tracks[0];
+    $selectedTrack = null;
 
-    foreach ($tracks as $t) {
-        if ($t["languageCode"] === "en" && !isset($t["kind"])) {
-            $track = $t;
+    /* ===============================
+       PRIORITY LOGIC (RELAXED)
+    ================================ */
+
+    // 1. Prefer ANY English variant (en, en-US, en-IN, etc.)
+    foreach ($tracks as $track) {
+        if (strpos($track["languageCode"], "en") === 0) {
+            $selectedTrack = $track;
             break;
         }
     }
 
-    $xmlData = @file_get_contents($track["baseUrl"]);
+    // 2. If no English found, take the first available caption
+    if (!$selectedTrack) {
+        $selectedTrack = $tracks[0];
+    }
+
+    /* ===============================
+       FETCH XML CAPTIONS
+    ================================ */
+    $xmlData = @file_get_contents($selectedTrack["baseUrl"]);
     if ($xmlData === false) return false;
 
     $xml = @simplexml_load_string($xmlData);
@@ -85,15 +112,15 @@ function get_youtube_transcript($vId) {
 
     $text = "";
     foreach ($xml->text as $line) {
-        $text .= html_entity_decode((string)$line) . " ";
+        $text .= html_entity_decode((string)$line, ENT_QUOTES | ENT_XML1) . " ";
     }
 
     return trim($text);
 }
 
-// ===============================
-// RESPONSE
-// ===============================
+/* ===============================
+   RESPONSE
+================================ */
 $transcript = get_youtube_transcript($videoId);
 
 if ($transcript) {
@@ -104,6 +131,7 @@ if ($transcript) {
 } else {
     echo json_encode([
         "success" => false,
-        "error" => "No transcript found"
+        "error" =>
+            "Captions are currently unavailable via YouTube API for this video."
     ]);
 }
